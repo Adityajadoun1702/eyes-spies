@@ -6,4 +6,6 @@ __pycache__/
 venv/
 .env
 *.pt
+!backend/models/context_head.pt
+training-data/
 .DS_Store

@@ -9,13 +9,74 @@ function formatPercent(value) {
 export default function App() {
   const videoRef = useRef(null);
   const canvasRef = useRef(null);
+  const imageInputRef = useRef(null);
   const streamRef = useRef(null);
   const loopRef = useRef(false);
+  const confidenceRef = useRef(0.35);
   const [cameraOn, setCameraOn] = useState(false);
+  const [confidenceThreshold, setConfidenceThreshold] = useState(0.35);
+  const [imagePreview, setImagePreview] = useState("");
   const [cameraError, setCameraError] = useState("");
   const [apiError, setApiError] = useState("");
   const [status, setStatus] = useState("Ready");
   const [result, setResult] = useState(null);
+  const [imageCaption, setImageCaption] = useState("");
+  const [captionLoading, setCaptionLoading] = useState(false);
+
+  const analyzeImage = useCallback(async (blob, includeCaption = false) => {
+    try {
+      setStatus("Analyzing image");
+      const params = new URLSearchParams({
+        confidence_threshold: confidenceRef.current.toString(),
+      });
+      if (includeCaption) params.set("include_caption", "true");
+      const response = await fetch(`/api/analyze?${params}`, {
+        method: "POST",
+        headers: { "Content-Type": blob.type },
+        body: blob,
+      });
+      if (!response.ok) {
+        const detail = await response.json().catch(() => ({}));
+        throw new Error(detail.detail || `Analysis failed (${response.status}).`);
+      }
+
+      const analysis = await response.json();
+      setResult(analysis);
+      if (includeCaption) setImageCaption(analysis.caption || "");
+      setApiError("");
+      setStatus("Analysis complete");
+    } catch (error) {
+      setApiError(error.message || "Could not reach the analysis API.");
+      setStatus("Analysis unavailable");
+    }
+  }, []);
+
+  const handleImageUpload = async (event) => {
+    const file = event.target.files?.[0];
+    event.target.value = "";
+    if (!file) return;
+
+    if (!["image/jpeg", "image/png", "image/webp"].includes(file.type)) {
+      setApiError("Choose a JPEG, PNG, or WebP image.");
+      return;
+    }
+    if (file.size > 5 * 1024 * 1024) {
+      setApiError("Choose an image smaller than 5 MB.");
+      return;
+    }
+
+    const previewUrl = URL.createObjectURL(file);
+    setImagePreview((previousUrl) => {
+      if (previousUrl) URL.revokeObjectURL(previousUrl);
+      return previewUrl;
+    });
+    setResult(null);
+    setImageCaption("");
+    setApiError("");
+    setCaptionLoading(true);
+    await analyzeImage(file, true);
+    setCaptionLoading(false);
+  };
 
   const stopCamera = useCallback(() => {
     loopRef.current = false;
@@ -40,34 +101,20 @@ export default function App() {
       const context = canvas.getContext("2d");
       context.drawImage(video, 0, 0, canvas.width, canvas.height);
 
-      try {
-        setStatus("Analyzing frame");
-        const blob = await new Promise((resolve) =>
-          canvas.toBlob(resolve, "image/jpeg", 0.8),
-        );
-        if (!blob) throw new Error("Could not capture a camera frame.");
-
-        const response = await fetch("/api/analyze", {
-          method: "POST",
-          headers: { "Content-Type": "image/jpeg" },
-          body: blob,
-        });
-        if (!response.ok) {
-          const detail = await response.json().catch(() => ({}));
-          throw new Error(detail.detail || `Analysis failed (${response.status}).`);
-        }
-
-        setResult(await response.json());
-        setApiError("");
-        setStatus("Live");
-      } catch (error) {
-        setApiError(error.message || "Could not reach the analysis API.");
+      const blob = await new Promise((resolve) =>
+        canvas.toBlob(resolve, "image/jpeg", 0.8),
+      );
+      if (!blob) {
+        setApiError("Could not capture a camera frame.");
         setStatus("Analysis unavailable");
+      } else {
+        await analyzeImage(blob);
+        if (loopRef.current) setStatus("Live");
       }
 
       await new Promise((resolve) => window.setTimeout(resolve, ANALYSIS_INTERVAL_MS));
     }
-  }, []);
+  }, [analyzeImage]);
 
   const startCamera = async () => {
     setCameraError("");
@@ -106,6 +153,10 @@ export default function App() {
     streamRef.current?.getTracks().forEach((track) => track.stop());
   }, []);
 
+  useEffect(() => () => {
+    if (imagePreview) URL.revokeObjectURL(imagePreview);
+  }, [imagePreview]);
+
   const detections = result?.detections ?? [];
 
   return (
@@ -140,13 +191,6 @@ export default function App() {
 
           <div className="video-stage">
             <video ref={videoRef} className={cameraOn ? "visible" : ""} playsInline muted />
-            {!cameraOn && (
-              <div className="camera-placeholder">
-                <div className="camera-icon" aria-hidden="true">◎</div>
-                <strong>Your camera view will appear here</strong>
-                <span>Camera frames are analyzed locally through your API.</span>
-              </div>
-            )}
             {cameraOn && result && videoRef.current && (
               <div className="detection-layer" aria-hidden="true">
                 {detections.map((detection, index) => {
@@ -168,21 +212,83 @@ export default function App() {
                 })}
               </div>
             )}
+            {!cameraOn && imagePreview && (
+              <img className="uploaded-image" src={imagePreview} alt="Image selected for analysis" />
+            )}
+            {!cameraOn && !imagePreview && (
+              <div className="camera-placeholder">
+                <div className="camera-icon" aria-hidden="true">◎</div>
+                <strong>Your camera or selected image will appear here</strong>
+                <span>Choose a sample photo to test the vision models.</span>
+              </div>
+            )}
           </div>
           <canvas ref={canvasRef} className="hidden-canvas" />
+          <input
+            ref={imageInputRef}
+            className="hidden-canvas"
+            type="file"
+            accept="image/jpeg,image/png,image/webp"
+            onChange={handleImageUpload}
+          />
           {cameraError && <p className="error-message">{cameraError}</p>}
           {apiError && <p className="error-message">{apiError}</p>}
           <div className="camera-footer">
-            <span>Frames analyzed about once per second</span>
+            <span>{cameraOn ? "Frames analyzed about once per second" : "Try a sample image or live camera"}</span>
             {cameraOn ? (
               <button className="button button-stop" onClick={stopCamera}>Stop camera</button>
             ) : (
-              <button className="button button-start" onClick={startCamera}>Start camera <span aria-hidden="true">↗</span></button>
+              <div className="camera-actions">
+                <button
+                  className="button button-upload"
+                  onClick={() => imageInputRef.current?.click()}
+                >
+                  Choose image
+                </button>
+                <button className="button button-start" onClick={startCamera}>Start camera <span aria-hidden="true">↗</span></button>
+              </div>
             )}
+          </div>
+          <div className="confidence-control">
+            <label htmlFor="confidence-threshold">
+              Detection confidence
+              <strong>{formatPercent(confidenceThreshold)}</strong>
+            </label>
+            <input
+              id="confidence-threshold"
+              type="range"
+              min="0.1"
+              max="0.9"
+              step="0.05"
+              value={confidenceThreshold}
+              onChange={(event) => {
+                const value = Number(event.target.value);
+                confidenceRef.current = value;
+                setConfidenceThreshold(value);
+              }}
+              aria-describedby="confidence-help"
+            />
+            <span id="confidence-help" className="confidence-help">
+              Higher values hide uncertain detections; changes apply to the next frame.
+            </span>
           </div>
         </div>
 
         <aside className="results-column">
+          {!cameraOn && (imagePreview || captionLoading) && (
+            <section className="result-card caption-card" aria-live="polite">
+              <div className="card-kicker">IMAGE ANALYSIS</div>
+              <h2>What’s happening?</h2>
+              <p className="caption-text">
+                {captionLoading
+                  ? "Generating a description of your image…"
+                  : imageCaption || "The image description is not available."}
+              </p>
+              <p className="muted-note">
+                Generated by an image-captioning model; verify important details yourself.
+              </p>
+            </section>
+          )}
           <section className="result-card">
             <div className="card-kicker">SCENE CONTEXT</div>
             <h2>Where are we?</h2>
@@ -229,7 +335,7 @@ export default function App() {
             )}
           </section>
 
-          <p className="privacy-note"><span aria-hidden="true">◈</span> Frames are processed by your local backend and aren’t saved.</p>
+          <p className="privacy-note"><span aria-hidden="true">◈</span> Camera frames are sent to the server for analysis and aren’t saved by this app.</p>
         </aside>
       </section>
 
